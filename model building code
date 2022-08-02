@@ -1,0 +1,297 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import numpy as np
+import tensorflow as tf
+import os
+
+from tensorflow import keras
+from keras import layers
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from tensorflow.keras import regularizers
+
+BATCH_SIZE = 64
+IMG_SIZE = (224,224)
+train_dataset = image_dataset_from_directory(root_path+'/training set',
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
+validation_dataset = image_dataset_from_directory(root_path+'/validation set',
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
+
+train_dataset.prefetch(tf.data.AUTOTUNE)
+
+
+# Establish weights for weighted binary cross entropy loss calculation, to account for class imbalance
+
+# Extract np array of labels
+train_labels = np.concatenate([label for data, label in train_dataset], axis=0)
+
+# Count number of culture positive and culture negative cases
+counts = np.bincount(train_labels)
+print(
+    "Number of positive samples in training data: {} ({:.2f}% of total)".format(
+        counts[1], 100 * float(counts[1]) / len(train_labels)
+    )
+)
+
+# Compute weights based on prevalence in training data
+weight_for_0 = 1 - (counts[0] / counts.sum())
+weight_for_1 = 1 - (counts[1] / counts.sum())
+class_weight = {0: weight_for_0, 1: weight_for_1}
+
+
+def build_augmenter():
+    model = keras.Sequential([
+        layers.RandomFlip('horizontal'),
+        layers.RandomRotation((0.05)),
+        layers.RandomZoom(0.2),
+    ],
+    name='Data_Augmentation')
+    
+    return model
+
+
+# TRAIN FEATURE EXTRACTOR
+
+IMG_SHAPE = IMG_SIZE + (3,)
+# Build Feature extractor
+def build_feat_extractor(dropout = 0.3):
+    conv_base = tf.keras.applications.DenseNet201(input_shape=IMG_SHAPE,
+                                              include_top=False,
+                                              weights='imagenet')
+    conv_base.trainable = False
+    inputs = keras.Input(shape=IMG_SHAPE)
+    data_augmentation = build_augmenter()
+    x = data_augmentation(inputs)
+    x = keras.applications.densenet.preprocess_input(x)
+    x = conv_base(x, training = False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(dropout)(x)
+    outputs = layers.Dense(1,activation = 'sigmoid')(x)
+    model = keras.Model(inputs,outputs)
+    
+    return model
+
+
+feat_extract_callbacks_list = [
+    keras.callbacks.EarlyStopping( # Stop training if validation loss does not improve for 3 epochs
+    monitor = 'val_loss', # use validation loss as the criterion, which is weighted for class imbalance
+    patience = 5,
+    ),
+    keras.callbacks.ModelCheckpoint( # Save the version of the model with the lowest validation loss during training
+    filepath = root_path + 'feat_extractor_checkpoint.keras',
+    monitor = 'val_loss',
+    save_best_only = True),
+    keras.callbacks.TensorBoard( # Enable Tensorboard for monitoring training progress
+    log_dir = root_path+ "logs/feat_extract/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+]
+
+model = build_feat_extractor()
+model.compile(optimizer=tf.keras.optimizers.RMSprop(learning_rate=1e-4),
+                loss='binary_crossentropy',
+                metrics=['AUC','accuracy'])
+
+
+history = model.fit(train_dataset, 
+                    validation_data=validation_dataset, 
+                    epochs=10, 
+                    class_weight=class_weight, # Apply weighted loss metric to account for class imbalance
+                   callbacks = feat_extract_callbacks_list)
+
+feature_extractor = keras.models.load_model(root_path + 'feat_extractor_checkpoint.keras')
+
+
+trained_top_layer = feature_extractor.layers[-1]
+
+
+# BUILD FINE TUNED MODEL
+
+# Create F score metric by subclassing the Metric class
+class StatefulFscore(keras.metrics.Metric):
+  def __init__(self, name='stateful_F_score', beta=1, threshold=0.5, epsilon=1e-7, **kwargs):
+    # initializing an object of the super class
+    super().__init__(name=name, **kwargs)
+
+    # initializing state variables
+    self.tp = self.add_weight(name='tp', initializer='zeros') # initializing true positives 
+    self.actual_positive = self.add_weight(name='fp', initializer='zeros') # initializing actual positives
+    self.predicted_positive = self.add_weight(name='fn', initializer='zeros') # initializing predicted positives
+
+    # initializing other atrributes that wouldn't be changed for every object of this class
+    self.beta_squared = beta**2 
+    self.threshold = threshold
+    self.epsilon = epsilon
+
+  def update_state(self, ytrue, ypred, sample_weight=None):
+    # casting ytrue and ypred as float dtype
+    ytrue = tf.cast(ytrue, tf.float32)
+    ypred = tf.cast(ypred, tf.float32)
+
+    # setting values of ypred greater than the set threshold to 1 while those lesser to 0
+    ypred = tf.cast(tf.greater_equal(ypred, tf.constant(self.threshold)), tf.float32)
+        
+    self.tp.assign_add(tf.reduce_sum(ytrue*ypred)) # updating true positives atrribute
+    self.predicted_positive.assign_add(tf.reduce_sum(ypred)) # updating predicted positive atrribute
+    self.actual_positive.assign_add(tf.reduce_sum(ytrue)) # updating actual positive atrribute
+
+  def result(self):
+    self.precision = self.tp/(self.predicted_positive+self.epsilon) # calculates precision
+    self.recall = self.tp/(self.actual_positive+self.epsilon) # calculates recall
+
+    # calculating fbeta
+    self.fb = (1+self.beta_squared)*self.precision*self.recall / (self.beta_squared*self.precision + self.recall + self.epsilon)
+    
+    return self.fb
+
+  def reset_state(self):
+    self.tp.assign(0) # resets true positives to zero
+    self.predicted_positive.assign(0) # resets predicted positives to zero
+    self.actual_positive.assign(0) # resets actual positives to zero
+
+fine_tune_callbacks_list = [
+    keras.callbacks.EarlyStopping( # Stop training if validation loss does not improve for 3 epochs
+    monitor = 'val_loss', # use validation loss as the criterion, which is weighted for class imbalance
+    patience = 5,
+    ),
+    keras.callbacks.ModelCheckpoint( # Save the version of the model with the lowest validation loss during training
+    filepath = root_path + 'fine_tune_checkpoint.keras',
+    monitor = 'val_loss',
+    save_best_only = True),
+    keras.callbacks.CSVLogger( # Log training results in a CSV file
+    root_path + 'training_log.csv'),
+    keras.callbacks.TensorBoard( # Enable Tensorboard for monitoring training progress
+    log_dir = root_path + "logs/fine_tune/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+]
+
+
+# Define model architecture
+def model_architecture(dropout_rate, lr, frozen_layer):
+    inputs = keras.Input(shape=IMG_SHAPE)
+    data_augmentation = build_augmenter()
+    x = data_augmentation(inputs)
+    x = keras.applications.densenet.preprocess_input(x)
+    conv_base = tf.keras.applications.DenseNet201(input_shape=IMG_SHAPE,
+                                          include_top=False,
+                                          weights='imagenet')
+    x = conv_base(x, training = False)
+    conv_base.trainable = True
+    for layer in conv_base.layers[:frozen_layer]:
+        layer.trainable = False
+    for layer in conv_base.layers:
+        if 'BatchNormalization' in str(layer.name_scope):
+                layer.trainable = False # Avoid re-training Batch Norm layers to maintain fixed mean/SD values for these layers
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(dropout_rate)(x)
+    outputs = trained_top_layer(x) # Use pre-trained top layer from feature extractor model
+    
+    model = tf.keras.Model(inputs,outputs)
+    
+    model.compile(optimizer = tf.keras.optimizers.RMSprop(learning_rate = lr),
+                        loss='binary_crossentropy',
+                        metrics=['AUC','accuracy',StatefulFscore()])
+    
+    return model
+
+fine_tune_model = model_architecture(dropout_rate=0.3,lr=1e-5,frozen_layer=600)
+
+history_tuning = fine_tune_model.fit(train_dataset, 
+                    validation_data=validation_dataset, 
+                    epochs=20, 
+                    class_weight=class_weight, 
+                   callbacks = fine_tune_callbacks_list) # Apply weighted loss metric to account for class imbalance
+
+
+# TUNE HYPERPARAMETERS
+
+
+hp = kt.HyperParameters()
+def hpsearchmodel(hp):
+    lr = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
+    dropout_rate = hp.Float("dropout_rate", min_value = 0.1, max_value = 0.5, step = 0.1)
+    frozen_layer = hp.Int(name = 'frozen_layer', min_value = 100, max_value = 650, step = 50)
+    # call existing model-building code with the hyperparameter values.
+    model = model_architecture(
+        dropout_rate=dropout_rate, lr=lr, frozen_layer=frozen_layer
+    )
+    return model
+
+
+# Hyperparameter search
+tuner = kt.BayesianOptimization(
+    hpsearchmodel,
+    objective="val_loss",
+    max_trials=10,
+    executions_per_trial=1,
+    overwrite=True,
+    directory="hyperparam_search",
+)
+
+
+tuner.search_space_summary()
+
+
+hp_callbacks_list = [
+    keras.callbacks.EarlyStopping( # Stop training if validation loss does not improve for 5 epochs
+    monitor = 'val_loss', # use validation loss as the criterion, which is weighted for class imbalance
+    patience = 6,
+    )
+]
+
+
+tuner.search(train_dataset, 
+                    validation_data=validation_dataset, 
+                    epochs=100, 
+                    class_weight=class_weight, 
+                   callbacks = hp_callbacks_list)
+
+
+
+tuner.results_summary()
+
+
+# In[42]:
+
+
+best_hps = tuner.get_best_hyperparameters() # returns list of the best sets of hyperparameter objects
+
+
+
+def get_best_epoch(hp):
+    model = hpsearchmodel(hp)
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+        monitor='val_loss',mode='min',patience=10) # Set high patience value because we want the best possible estimate of ideal epoch
+    ]
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=100,
+        class_weight=class_weight,
+        callbacks=callbacks
+    )
+    val_loss_per_epoch = history.history['val_loss']
+    best_epoch = val_loss_per_epoch.index(min(val_loss_per_epoch)) + 1
+    print('best epoch: '+str(best_epoch))
+    return best_epoch
+
+
+full_train_dataset = train_dataset.concatenate(validation_dataset)
+
+
+def get_best_trained_model(hp):
+    best_epoch = get_best_epoch(hp)
+    model.fit(full_train_dataset,epochs=int(best_epoch*1.1))
+    return model
+
+for hp in best_hps:
+    final_model = get_best_trained_model(hp)
+
+
+test_dataset = image_dataset_from_directory(root_path + '/test set',
+                                            shuffle=False,
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
+
+
+final_model.evaluate(test_dataset)
